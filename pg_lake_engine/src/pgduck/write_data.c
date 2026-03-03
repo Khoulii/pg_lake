@@ -37,8 +37,8 @@
 #include "pg_lake/util/numeric.h"
 #include "nodes/pg_list.h"
 #include "utils/builtins.h"
+#include "pg_lake/pgduck/parse_struct.h"
 #include "utils/lsyscache.h"
-
 
 static char *TupleDescToProjectionListForWrite(TupleDesc tupleDesc,
 											   CopyDataFormat destinationFormat);
@@ -131,13 +131,19 @@ WriteQueryResultTo(char *query,
 	/* start WITH options */
 	appendStringInfoString(&command, " WITH (");
 
-	const char *formatName = CopyDataFormatToName(destinationFormat);
+	/*
+	 * Iceberg data files are Parquet, so use "parquet" as the DuckDB
+	 * format name for both DATA_FORMAT_PARQUET and DATA_FORMAT_ICEBERG.
+	 */
+	const char *formatName = (destinationFormat == DATA_FORMAT_ICEBERG) ?
+		"parquet" : CopyDataFormatToName(destinationFormat);
 
 	appendStringInfo(&command, "format %s",
 					 quote_literal_cstr(formatName));
 
 	switch (destinationFormat)
 	{
+		case DATA_FORMAT_ICEBERG:
 		case DATA_FORMAT_PARQUET:
 			{
 				if (destinationCompression == DATA_COMPRESSION_NONE)
@@ -331,14 +337,6 @@ WriteQueryResultTo(char *query,
 						}
 					}
 				}
-
-				break;
-			}
-
-		case DATA_FORMAT_ICEBERG:
-			{
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("writing in Iceberg format is not supported")));
 
 				break;
 			}
@@ -654,6 +652,25 @@ ChooseDuckDBEngineTypeForWrite(PGType postgresType,
 		duckTypeId = DUCKDB_TYPE_VARCHAR;
 		isArrayType = false;
 	}
+	else if (duckTypeId == DUCKDB_TYPE_INTERVAL && destinationFormat == DATA_FORMAT_ICEBERG)
+	{
+		/*
+		 * Iceberg does not have a native interval type. We store intervals as
+		 * struct(months BIGINT, days BIGINT, microseconds BIGINT) in both the
+		 * Iceberg metadata and Parquet data files. For plain Parquet files,
+		 * DuckDB uses its native INTERVAL type.
+		 */
+		char	   *intervalTypeName =
+			psprintf("STRUCT(months BIGINT, days BIGINT, microseconds BIGINT)%s",
+					 isArrayType ? "[]" : "");
+		DuckDBTypeInfo typeInfo = {
+			.typeId = DUCKDB_TYPE_STRUCT,
+			.typeName = intervalTypeName,
+			.isArrayType = isArrayType,
+		};
+
+		return typeInfo;
+	}
 
 	/*
 	 * In case of both JSON and Parquet, composites/arrays/maps are serialized
@@ -668,10 +685,13 @@ ChooseDuckDBEngineTypeForWrite(PGType postgresType,
 	char	   *typeName;
 
 	if (duckTypeId == DUCKDB_TYPE_STRUCT || duckTypeId == DUCKDB_TYPE_MAP)
+	{
 		/* generate field names for struct/map */
-		typeName = psprintf("%s%s",
-							GetFullDuckDBTypeNameForPGType(postgresType),
-							isArrayType ? "[]" : "");
+		const char *structDef =
+			GetFullDuckDBTypeNameForPGType(postgresType, destinationFormat);
+
+		typeName = psprintf("%s%s", structDef, isArrayType ? "[]" : "");
+	}
 	else
 		typeName = psprintf("%s%s%s",
 							GetDuckDBTypeName(duckTypeId),

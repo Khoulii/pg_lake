@@ -27,6 +27,7 @@
 #include "pg_lake/pgduck/struct_conversion.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/timestamp.h"
 
 
 static char *ByteAOutForPGDuck(Datum value);
@@ -42,19 +43,26 @@ static char *ByteAOutForPGDuck(Datum value);
  * DuckDB-compatible text format.
  */
 char *
-PGDuckSerialize(FmgrInfo *flinfo, Oid columnType, Datum value)
+PGDuckSerialize(FmgrInfo *flinfo, Oid columnType, Datum value,
+				CopyDataFormat format)
 {
 	if (flinfo->fn_oid == ARRAY_OUT_OID)
 	{
 		/* maps are a type of array */
 		if (IsMapTypeOid(columnType))
-			return MapOutForPGDuck(value);
+			return MapOutForPGDuck(value, format);
 
-		return ArrayOutForPGDuck(DatumGetArrayTypeP(value));
+		return ArrayOutForPGDuck(DatumGetArrayTypeP(value), format);
 	}
 
 	if (flinfo->fn_oid == RECORD_OUT_OID)
-		return StructOutForPGDuck(value);
+		return StructOutForPGDuck(value, format);
+
+	/*
+	 * For Iceberg, intervals are serialized as struct(months, days, microseconds).
+	 */
+	if (columnType == INTERVALOID && format == DATA_FORMAT_ICEBERG)
+		return IntervalOutForPGDuck(value);
 
 	if (columnType == BYTEAOID)
 		return ByteAOutForPGDuck(value);
@@ -126,6 +134,36 @@ ByteAOutForPGDuck(Datum value)
 
 	return outputBuffer;
 }
+
+/*
+ * IntervalOutForPGDuck serializes a PostgreSQL interval as a DuckDB struct:
+ * {'months': M, 'days': D, 'microseconds': U}
+ */
+char *
+IntervalOutForPGDuck(Datum value)
+{
+	Interval   *interval = DatumGetIntervalP(value);
+
+#if PG_VERSION_NUM >= 170000
+	if (INTERVAL_NOT_FINITE(interval))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("+-Infinity intervals are not allowed in iceberg tables"),
+				 errhint("Delete or replace +-Infinity values.")));
+#endif
+
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					 "{'months': %d, 'days': %d, 'microseconds': " INT64_FORMAT "}",
+					 interval->month,
+					 interval->day,
+					 interval->time);
+
+	return buf.data;
+}
+
 
 /* Helper to see if we are a "container" type oid */
 bool

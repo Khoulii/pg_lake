@@ -229,6 +229,36 @@ PostgresTypeToIcebergField(PGType pgType, bool forAddColumn, int *subFieldIndex)
 
 		ReleaseTupleDesc(tupleDesc);
 	}
+	else if (typeId == INTERVALOID)
+	{
+		/*
+		 * Iceberg does not have a native interval type. We represent it as a
+		 * struct with months, days, and microseconds fields, matching the
+		 * internal PostgreSQL interval representation. This is self-describing
+		 * and readable by any Iceberg-compatible engine.
+		 */
+		const char *names[] = {"months", "days", "microseconds"};
+
+		field->type = FIELD_TYPE_STRUCT;
+		field->field.structType.nfields = 3;
+		field->field.structType.fields = palloc0(sizeof(FieldStructElement) * 3);
+
+		for (int i = 0; i < 3; i++)
+		{
+			FieldStructElement *elem = &field->field.structType.fields[i];
+
+			elem->id = *subFieldIndex + 1;
+			*subFieldIndex = elem->id;
+			elem->name = pstrdup(names[i]);
+			elem->required = true;
+
+			Field	   *subField = palloc0(sizeof(Field));
+
+			subField->type = FIELD_TYPE_SCALAR;
+			subField->field.scalar.typeName = pstrdup("long");
+			elem->type = subField;
+		}
+	}
 	else if (IsMapTypeOid(typeId))
 	{
 		field->type = FIELD_TYPE_MAP;
@@ -301,7 +331,7 @@ IcebergFieldToPostgresType(Field * field)
 				PGType		elementPGType =
 					IcebergFieldToPostgresType(field->field.list.element);
 
-				const char *elementDuckDBTypeName = GetFullDuckDBTypeNameForPGType(elementPGType);
+				const char *elementDuckDBTypeName = GetFullDuckDBTypeNameForPGType(elementPGType, DATA_FORMAT_ICEBERG);
 
 				StringInfo	listTypeName = makeStringInfo();
 
@@ -324,12 +354,12 @@ IcebergFieldToPostgresType(Field * field)
 				PGType		keyPGType =
 					IcebergFieldToPostgresType(field->field.map.key);
 
-				const char *keyDuckDBTypeName = GetFullDuckDBTypeNameForPGType(keyPGType);
+				const char *keyDuckDBTypeName = GetFullDuckDBTypeNameForPGType(keyPGType, DATA_FORMAT_ICEBERG);
 
 				PGType		valuePGType =
 					IcebergFieldToPostgresType(field->field.map.value);
 
-				const char *valueDuckDBTypeName = GetFullDuckDBTypeNameForPGType(valuePGType);
+				const char *valueDuckDBTypeName = GetFullDuckDBTypeNameForPGType(valuePGType, DATA_FORMAT_ICEBERG);
 
 				StringInfo	mapTypeName = makeStringInfo();
 
@@ -368,7 +398,7 @@ IcebergFieldToPostgresType(Field * field)
 					PGType		fieldPGType =
 						IcebergFieldToPostgresType(structElementField->type);
 
-					const char *fieldDuckDBTypeName = GetFullDuckDBTypeNameForPGType(fieldPGType);
+					const char *fieldDuckDBTypeName = GetFullDuckDBTypeNameForPGType(fieldPGType, DATA_FORMAT_ICEBERG);
 
 					appendStringInfo(structTypeName, "%s %s",
 									 quotedFieldName,

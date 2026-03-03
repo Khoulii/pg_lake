@@ -25,7 +25,22 @@
 
 #define BYTEA_OUT_OID 31
 
-extern PGDLLEXPORT char *PGDuckSerialize(FmgrInfo *flinfo, Oid typeOid, Datum value);
+extern PGDLLEXPORT char *PGDuckSerialize(FmgrInfo *flinfo, Oid typeOid, Datum value,
+										 CopyDataFormat format);
 extern PGDLLEXPORT char *PGDuckOnlySerialize(Oid typeOid, Datum value);
 extern PGDLLEXPORT bool IsPGDuckSerializeRequired(PGType postgresType);
+extern PGDLLEXPORT char *IntervalOutForPGDuck(Datum value);
 extern bool IsContainerType(Oid postgresType);
+
+/*
+ * IsSerializedAsContainer returns whether a type will be serialized as a
+ * container (struct/array/map) for the given format. Iceberg intervals are
+ * serialized as struct(months, days, microseconds), so they count as
+ * containers in that context.
+ */
+static inline bool
+IsSerializedAsContainer(Oid typeId, CopyDataFormat format)
+{
+	return IsContainerType(typeId) ||
+		(typeId == INTERVALOID && format == DATA_FORMAT_ICEBERG);
+}

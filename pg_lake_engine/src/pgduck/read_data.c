@@ -32,12 +32,15 @@
 #include "pg_lake/pgduck/client.h"
 #include "pg_lake/pgduck/read_data.h"
 #include "pg_lake/pgduck/type.h"
+#include "pg_lake/pgduck/map.h"
 #include "pg_lake/util/numeric.h"
 #include "nodes/parsenodes.h"
 #include "nodes/makefuncs.h"
 #include "nodes/pg_list.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "access/htup_details.h"
+#include "utils/typcache.h"
 
 
 static char *ReadDataSourceFunction(List *sourcePaths,
@@ -67,6 +70,7 @@ static char *BuildColumnProjection(char *expression,
 								   CopyDataFormat sourceFormat,
 								   List *formatOptions,
 								   bool addAlias);
+static char *BuildMapWithIntervalProjection(char *columnName, Oid mapTypeId);
 static char *GetLogFormatRegex(List *options);
 static char *GetLogTimestampFormat(List *options);
 
@@ -715,10 +719,11 @@ ReadEmptyDataSource(TupleDesc tupleDesc, CopyDataFormat sourceFormat, bool prefe
 																   columnTypeMod,
 																   sourceFormat,
 																   preferVarchar);
+		DuckDBTypeInfo storageType = GuessStorageType(duckdbTypeInfo, sourceFormat);
 
 		appendStringInfo(&query, "%s NULL::%s AS %s",
 						 addComma ? "," : "",
-						 duckdbTypeInfo.typeName,
+						 storageType.typeName,
 						 quote_identifier(columnName));
 
 		addComma = true;
@@ -882,6 +887,140 @@ TupleDescToAliasList(TupleDesc tupleDesc)
 
 
 /*
+ * BuildMapWithIntervalProjection generates a DuckDB expression that
+ * reconstructs interval values inside a MAP type from their
+ * struct(months, days, microseconds) Iceberg representation.
+ *
+ * Returns NULL if the map value type is not INTERVAL.
+ */
+static char *
+BuildMapWithIntervalProjection(char *columnName, Oid mapTypeId)
+{
+	PGType		valType = GetMapValueType(mapTypeId);
+
+	if (valType.postgresTypeOid != INTERVALOID)
+		return NULL;
+
+	const char *col = quote_identifier(columnName);
+
+	return psprintf(
+					"map_from_entries("
+					"list_transform(map_entries(%s), _x -> "
+					"struct_pack(key := _x.key, value := "
+					"(to_months(_x.value.months) + "
+					"to_days(_x.value.days) + "
+					"to_microseconds(_x.value.microseconds))"
+					")))",
+					col);
+}
+
+
+/*
+ * BuildStructWithIntervalProjection generates a DuckDB expression that
+ * reconstructs interval fields inside a composite type from their
+ * struct(months, days, microseconds) Parquet representation.
+ *
+ * Returns NULL if the composite type has no interval fields.
+ */
+static char *
+BuildStructWithIntervalProjection(char *columnName, Oid compositeTypeId)
+{
+	Oid			baseTypeId = get_element_type(compositeTypeId);
+
+	if (!OidIsValid(baseTypeId))
+		baseTypeId = compositeTypeId;
+
+	if (get_typtype(baseTypeId) != TYPTYPE_COMPOSITE)
+		return NULL;
+
+	TupleDesc	tupdesc = lookup_rowtype_tupdesc(baseTypeId, -1);
+	bool		hasInterval = false;
+
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (att->attisdropped)
+			continue;
+
+		Oid			fieldBaseType = get_element_type(att->atttypid);
+
+		if (!OidIsValid(fieldBaseType))
+			fieldBaseType = att->atttypid;
+
+		if (fieldBaseType == INTERVALOID)
+		{
+			hasInterval = true;
+			break;
+		}
+	}
+
+	if (!hasInterval)
+	{
+		ReleaseTupleDesc(tupdesc);
+		return NULL;
+	}
+
+	StringInfoData buf;
+	const char *col = quote_identifier(columnName);
+
+	initStringInfo(&buf);
+	appendStringInfoChar(&buf, '{');
+
+	bool		first = true;
+
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (att->attisdropped)
+			continue;
+
+		if (!first)
+			appendStringInfoString(&buf, ", ");
+		first = false;
+
+		char	   *fieldName = NameStr(att->attname);
+
+		appendStringInfo(&buf, "'%s': ", fieldName);
+
+		Oid			fieldElementType = get_element_type(att->atttypid);
+		bool		isIntervalArray = OidIsValid(fieldElementType) &&
+			fieldElementType == INTERVALOID;
+
+		if (att->atttypid == INTERVALOID)
+		{
+			appendStringInfo(&buf,
+							 "(to_months(%s.%s.months) + to_days(%s.%s.days) + "
+							 "to_microseconds(%s.%s.microseconds))",
+							 col, quote_identifier(fieldName),
+							 col, quote_identifier(fieldName),
+							 col, quote_identifier(fieldName));
+		}
+		else if (isIntervalArray)
+		{
+			appendStringInfo(&buf,
+							 "list_transform(%s.%s, _x -> "
+							 "(to_months(_x.months) + to_days(_x.days) + "
+							 "to_microseconds(_x.microseconds)))",
+							 col, quote_identifier(fieldName));
+		}
+		else
+		{
+			appendStringInfo(&buf, "%s.%s",
+							 col, quote_identifier(fieldName));
+		}
+	}
+
+	appendStringInfoChar(&buf, '}');
+
+	ReleaseTupleDesc(tupdesc);
+
+	return buf.data;
+}
+
+
+/*
  * TupleDescToProjectionList converts a PostgreSQL tuple descriptor to
  * projection list in string form.
  *
@@ -919,9 +1058,58 @@ TupleDescToProjectionList(TupleDesc tupleDesc, CopyDataFormat sourceFormat,
 															   preferVarchar);
 
 		/*
-		 * We probably want to add an alias, but only if we are not going to
-		 * add our own later.
+		 * For composite types containing interval fields, we need to
+		 * reconstruct the intervals from struct(months, days, microseconds)
+		 * on the read path.
 		 */
+		if (duckdbType.typeId == DUCKDB_TYPE_STRUCT &&
+			sourceFormat == DATA_FORMAT_ICEBERG)
+		{
+			char	   *structProjection =
+				BuildStructWithIntervalProjection(columnName, columnTypeId);
+
+			if (structProjection != NULL)
+			{
+				char	   *columnAliasString =
+					!addCast ? psprintf(" AS %s", quote_identifier(columnName)) : "";
+
+				if (hasColumns)
+					appendStringInfoString(&projection, ", ");
+
+				appendStringInfo(&projection, "%s%s",
+								 structProjection, columnAliasString);
+
+				hasColumns = true;
+				continue;
+			}
+		}
+
+		/*
+		 * For MAP types with interval values, reconstruct intervals from
+		 * struct(months, days, microseconds) on the read path.
+		 */
+		if (duckdbType.typeId == DUCKDB_TYPE_MAP &&
+			sourceFormat == DATA_FORMAT_ICEBERG)
+		{
+			char	   *mapProjection =
+				BuildMapWithIntervalProjection(columnName, columnTypeId);
+
+			if (mapProjection != NULL)
+			{
+				char	   *columnAliasString =
+					!addCast ? psprintf(" AS %s", quote_identifier(columnName)) : "";
+
+				if (hasColumns)
+					appendStringInfoString(&projection, ", ");
+
+				appendStringInfo(&projection, "%s%s",
+								 mapProjection, columnAliasString);
+
+				hasColumns = true;
+				continue;
+			}
+		}
+
 		char	   *columnProjection = BuildColumnProjection(columnName,
 															 duckdbType,
 															 sourceFormat,
@@ -1020,7 +1208,9 @@ ChooseCompatibleDuckDBType(Oid postgresTypeId, int postgresTypeMod,
 			duckTypeId = DUCKDB_TYPE_VARCHAR;
 		}
 	}
-	else if (duckTypeId == DUCKDB_TYPE_BLOB && sourceFormat != DATA_FORMAT_PARQUET)
+	else if (duckTypeId == DUCKDB_TYPE_BLOB &&
+			 sourceFormat != DATA_FORMAT_PARQUET &&
+			 sourceFormat != DATA_FORMAT_ICEBERG)
 	{
 		/*
 		 * We currently treat bytea as text in JSON/CSV, because DuckDB's
@@ -1081,7 +1271,8 @@ ChooseCompatibleDuckDBType(Oid postgresTypeId, int postgresTypeMod,
 
 	if (duckTypeId == DUCKDB_TYPE_STRUCT || duckTypeId == DUCKDB_TYPE_MAP)
 		typeName = psprintf("%s%s",
-							GetFullDuckDBTypeNameForPGType(MakePGType(postgresTypeId, postgresTypeMod)),
+							GetFullDuckDBTypeNameForPGType(MakePGType(postgresTypeId, postgresTypeMod),
+														   sourceFormat),
 							isArrayType ? "[]" : "");
 	else
 		typeName = psprintf("%s%s%s",
@@ -1137,6 +1328,22 @@ GuessStorageType(DuckDBTypeInfo engineType, CopyDataFormat sourceFormat)
 			storageType.typeName = engineType.isArrayType ? "VARCHAR[]" : "VARCHAR";
 		}
 	}
+	else if (engineType.typeId == DUCKDB_TYPE_INTERVAL)
+	{
+		if (sourceFormat == DATA_FORMAT_ICEBERG)
+		{
+			/*
+			 * Iceberg stores intervals as struct(months, days, microseconds)
+			 * in Parquet data files. We read as STRUCT and convert back to
+			 * INTERVAL. Plain Parquet files use DuckDB's native INTERVAL
+			 * type.
+			 */
+			storageType.typeId = DUCKDB_TYPE_STRUCT;
+			storageType.typeName = engineType.isArrayType ?
+				"STRUCT(months BIGINT, days BIGINT, microseconds BIGINT)[]" :
+				"STRUCT(months BIGINT, days BIGINT, microseconds BIGINT)";
+		}
+	}
 
 	return storageType;
 }
@@ -1166,12 +1373,39 @@ BuildColumnProjection(char *columnName,
 {
 	char	   *columnAliasString = !addCast ? psprintf(" AS %s", quote_identifier(columnName)) : "";
 
+	if (engineType.typeId == DUCKDB_TYPE_INTERVAL)
+	{
+		if (sourceFormat == DATA_FORMAT_ICEBERG)
+		{
+			/*
+			 * Iceberg stores intervals as struct(months, days, microseconds).
+			 * We reconstruct the interval using DuckDB interval constructors.
+			 * Plain Parquet files use DuckDB's native INTERVAL type.
+			 */
+			const char *col = quote_identifier(columnName);
+
+			if (engineType.isArrayType)
+				return psprintf(
+								"list_transform(%s, _x -> "
+								"(to_months(_x.months) + "
+								"to_days(_x.days) + "
+								"to_microseconds(_x.microseconds)))%s",
+								col, columnAliasString);
+			else
+				return psprintf(
+								"(to_months(%s.months) + "
+								"to_days(%s.days) + "
+								"to_microseconds(%s.microseconds))%s",
+								col, col, col, columnAliasString);
+		}
+	}
+
 	if (engineType.typeId == DUCKDB_TYPE_GEOMETRY && !engineType.isArrayType)
 	{
 		/*
 		 * Geometry requires special casts using spatial functions
 		 */
-		if (sourceFormat == DATA_FORMAT_PARQUET || sourceFormat == DATA_FORMAT_ICEBERG)
+		if (FormatUsesParquet(sourceFormat))
 			/* assume geometry in Parquet is stored as WKB blob */
 			return psprintf("ST_GeomFromWKB(%s::blob)%s",
 							quote_identifier(columnName),
@@ -1373,10 +1607,9 @@ AppendReadCSVClause(StringInfo buf, const char *filePath,
 	}
 
 	/*
-	 * We might hit errors in DuckDB 0.9.2 for long lines and we see
-	 * excessive (infinite?) runtime for 0.10.0 when using parallel CSV
-	 * reads.  Use the default max_line_size in DuckDB as a safety
-	 * threshold.
+	 * We might hit errors in DuckDB 0.9.2 for long lines and we see excessive
+	 * (infinite?) runtime for 0.10.0 when using parallel CSV reads.  Use the
+	 * default max_line_size in DuckDB as a safety threshold.
 	 */
 	if (maxLineSize > DEFAULT_DUCKDB_MAX_LINE_SIZE)
 	{

@@ -731,7 +731,7 @@ ParseSkipToNextField(StructParserState * parse)
 static Oid
 FindOrCreatePGCompositeType(CompositeType * type)
 {
-	elog(DEBUG1, "Looking up existing composite postgres type for: %s", GetDuckDBStructDefinitionForCompositeType(type));
+	elog(DEBUG1, "Looking up existing composite postgres type for: %s", GetDuckDBStructDefinitionForCompositeType(type, DATA_FORMAT_INVALID));
 
 	/*
 	 * Structured as a do block so we can bail to our followup routine at any
@@ -1054,23 +1054,12 @@ FinalizeCompositeTypeName(CompositeType * type)
 }
 
 /*
- * Wrapper for decomposing a postgres type and returning the corresponding
- * STRUCT string.
- */
-char *
-GetDuckDBStructDefinitionForPGType(Oid postgresType)
-{
-	CompositeType *type = GetCompositeTypeForPGType(postgresType);
-
-	return GetDuckDBStructDefinitionForCompositeType(type);
-}
-
-/*
  * This function turns a CompositeType into a STRUCT type string.  It is
  * basically the inverse of the ParseStructType() routine.
  */
 char *
-GetDuckDBStructDefinitionForCompositeType(CompositeType * type)
+GetDuckDBStructDefinitionForCompositeType(CompositeType * type,
+										  CopyDataFormat format)
 {
 	ListCell   *lc;
 	StringInfo	string = makeStringInfo();
@@ -1093,7 +1082,7 @@ GetDuckDBStructDefinitionForCompositeType(CompositeType * type)
 		{
 			/* add a child composite type */
 			appendStringInfoString(string,
-								   GetDuckDBStructDefinitionForCompositeType(col->subStruct));
+								   GetDuckDBStructDefinitionForCompositeType(col->subStruct, format));
 		}
 		else
 		{
@@ -1107,7 +1096,7 @@ GetDuckDBStructDefinitionForCompositeType(CompositeType * type)
 
 			if (duckDBType)
 			{
-				const char *duckDBName = GetFullDuckDBTypeNameForPGType(baseColumnType);
+				const char *duckDBName = GetFullDuckDBTypeNameForPGType(baseColumnType, format);
 
 				if (duckDBName)
 					appendStringInfoString(string, duckDBName);

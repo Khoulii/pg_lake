@@ -1,5 +1,4 @@
 import pytest
-import psycopg2
 from utils_pytest import *
 
 import os
@@ -1472,34 +1471,6 @@ def test_transaction_ddl(pg_conn, s3, with_default_location):
     assert result[0][0] == None
 
     run_command("ROLLBACK", pg_conn)
-
-
-# Intervals are not yet supported as Iceberg columns
-def test_interval(pg_conn, s3, with_default_location):
-    error = run_command(
-        """
-        CREATE SCHEMA test_interval;
-        CREATE TABLE test_interval.test (i interval) USING iceberg;
-    """,
-        pg_conn,
-        raise_error=False,
-    )
-    assert "not yet supported" in error
-
-    pg_conn.rollback()
-
-    error = run_command(
-        """
-        CREATE SCHEMA test_interval;
-        CREATE TABLE test_interval.test (x int) USING iceberg;
-        ALTER TABLE test_interval.test ADD COLUMN y interval[];
-    """,
-        pg_conn,
-        raise_error=False,
-    )
-    assert "not yet supported" in error
-
-    pg_conn.rollback()
 
 
 def test_use_same_schema_when_needed(pg_conn, s3, with_default_location):

@@ -69,6 +69,7 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/ruleutils.h"
+#include "utils/timestamp.h"
 #include "utils/typcache.h"
 
 /*
@@ -765,6 +766,32 @@ ProcessNotShippableExpressionWalker(Node *node, IsShippableContext * context)
 			context->hasUnnest = true;
 	}
 
+	/*
+	 * DuckDB does not support infinite intervals, so we cannot push down
+	 * queries that contain +-infinity interval constants. Infinite intervals
+	 * were introduced in PostgreSQL 17.
+	 */
+#if PG_VERSION_NUM >= 170000
+	if (IsA(node, Const))
+	{
+		Const	   *constExpr = (Const *) node;
+
+		if (!constExpr->constisnull && constExpr->consttype == INTERVALOID)
+		{
+			Interval   *interval = DatumGetIntervalP(constExpr->constvalue);
+
+			if (INTERVAL_NOT_FINITE(interval))
+			{
+				if (context->stopAtFirstNotShippable)
+					return true;
+
+				RecordNotShippableObject(context, InvalidOid, InvalidOid,
+										 NOT_SHIPPABLE_INFINITE_CONST_VALUE);
+			}
+		}
+	}
+#endif
+
 	if (ExpressionHasNonShippableObject(node, srfAllowed, context))
 	{
 		if (context->stopAtFirstNotShippable)
@@ -1440,7 +1467,8 @@ QueryPushdownBeginScan(CustomScanState *node, EState *estate, int eflags)
 
 				fmgr_info(typeOutputFunctionId, &fmgrInfo);
 				scanState->parameterValues[parameterIndex] =
-					PGDuckSerialize(&fmgrInfo, parameterData->ptype, parameterData->value);
+					PGDuckSerialize(&fmgrInfo, parameterData->ptype, parameterData->value,
+									DATA_FORMAT_INVALID);
 			}
 		}
 	}

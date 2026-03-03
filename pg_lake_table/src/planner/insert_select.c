@@ -398,7 +398,7 @@ RelationColumnsSuitableForPushdown(Relation relation, CopyDataFormat sourceForma
 		/*
 		 * We only support nested types when the source is Parquet or Iceberg.
 		 */
-		if (sourceFormat != DATA_FORMAT_PARQUET && sourceFormat != DATA_FORMAT_ICEBERG)
+		if (!FormatUsesParquet(sourceFormat))
 		{
 			/* type_is_array also covers pg_map */
 			if (type_is_array(typeId) || get_typtype(typeId) == TYPTYPE_COMPOSITE)
@@ -419,6 +419,23 @@ RelationColumnsSuitableForPushdown(Relation relation, CopyDataFormat sourceForma
 		{
 			ereport(DEBUG4,
 					(errmsg("Geometry type is not pushdownable")));
+
+			return false;
+		}
+
+		/*
+		 * For Iceberg, intervals are stored as STRUCT(months, days,
+		 * microseconds). The pushdown path sends INTERVAL directly to DuckDB,
+		 * which cannot apply nested field_ids to a non-struct column. Fall
+		 * back to the row-by-row path which serializes intervals as structs.
+		 */
+		Oid			elemTypeId = get_element_type(typeId);
+
+		if ((typeId == INTERVALOID || elemTypeId == INTERVALOID) &&
+			sourceFormat == DATA_FORMAT_ICEBERG)
+		{
+			ereport(DEBUG4,
+					(errmsg("Interval type is not pushdownable for Iceberg")));
 
 			return false;
 		}
