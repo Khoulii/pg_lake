@@ -1344,6 +1344,18 @@ GuessStorageType(DuckDBTypeInfo engineType, CopyDataFormat sourceFormat)
 				"STRUCT(months BIGINT, days BIGINT, microseconds BIGINT)";
 		}
 	}
+	else if (engineType.typeId == DUCKDB_TYPE_TIME_TZ)
+	{
+		if (sourceFormat == DATA_FORMAT_ICEBERG)
+		{
+			/*
+			 * TimeTZ is stored as TIME (UTC-normalized) in Iceberg. Read as
+			 * TIME and let DuckDB cast to TIMETZ in the projection.
+			 */
+			storageType.typeId = DUCKDB_TYPE_TIME;
+			storageType.typeName = engineType.isArrayType ? "TIME[]" : "TIME";
+		}
+	}
 
 	return storageType;
 }
@@ -1420,6 +1432,27 @@ BuildColumnProjection(char *columnName,
 			/* assume geometry in JSON is stored as GeoJSON */
 			return psprintf("ST_GeomFromGeoJSON(%s)%s", quote_identifier(columnName),
 							columnAliasString);
+	}
+
+	if (engineType.typeId == DUCKDB_TYPE_TIME_TZ)
+	{
+		if (sourceFormat == DATA_FORMAT_ICEBERG)
+		{
+			/*
+			 * TimeTZ is stored as TIME (UTC-normalized) in Iceberg. Cast to
+			 * TIMETZ so the UTC offset (+00) is preserved rather than having
+			 * the session timezone applied during text parsing.
+			 */
+			const char *col = quote_identifier(columnName);
+
+			if (engineType.isArrayType)
+				return psprintf(
+								"list_transform(%s, _x -> _x::TIMETZ)%s",
+								col, columnAliasString);
+			else
+				return psprintf("%s::TIMETZ%s",
+								col, columnAliasString);
+		}
 	}
 
 	if (sourceFormat == DATA_FORMAT_LOG)
